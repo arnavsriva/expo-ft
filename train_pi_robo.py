@@ -179,6 +179,16 @@ def main(_):
 
     # Load task config from YAML
     cfg = load_task_config(FLAGS.task_config)
+    # wallclock-vla-rl: env overrides + optional phase tracing (no-op unless WALLCLOCK_TRACE is set)
+    from expo_ft.utils.wallclock_hooks import apply_env_overrides, make_wallclock
+    apply_env_overrides(cfg)
+    WC = make_wallclock({
+        "role": "sync", "mode": "sync", "task": getattr(cfg, "env_id", None),
+        "control_hz": getattr(cfg, "control_hz", None), "utd_ratio": getattr(cfg, "utd_ratio", None),
+        "replan_steps": getattr(cfg, "replan_steps", None), "batch_size": getattr(cfg, "batch_size", None),
+        "seed": getattr(cfg, "seed", None), "num_updates": getattr(cfg, "num_updates", None),
+        "update_type": getattr(cfg, "update_type", None),
+    })
     # Override pi05_config_name dynamically from task config
     from expo_ft.utils.config_loader import get_sft_config_name
     FLAGS.config.pi05_config_name = get_sft_config_name(cfg)
@@ -1040,7 +1050,10 @@ def main(_):
             batch, actor_batch, combine_rng = batch_processor.next_batch(combine_rng)
             metrics["batch_info"] = get_batch_info(batch)
             agent = agent.replace(rng=jax.device_put(agent.rng, replicated_sharding))
-            agent, update_info = agent.update(agent, batch, cfg.utd_ratio, actor_batch)
+            with WC.phase("learner_update", thread="learner", update=WC.n_updates,
+                          extra={"utd_ratio": cfg.utd_ratio, "batch_size": cfg.batch_size}):
+                agent, update_info = agent.update(agent, batch, cfg.utd_ratio, actor_batch)
+            WC.n_updates += cfg.utd_ratio  # agent.update runs utd_ratio gradient steps
             training_log.record_update_time(time.time() - update_start, metrics)
             for k, v in update_info.items():
                 metrics[f"training/{k}"] = v
@@ -1215,7 +1228,8 @@ def main(_):
 
             has_action = bool(action_plan)
             action = action_plan.popleft() if has_action else np.zeros_like(example_action.squeeze())
-            real_action, action_type = env.step(action.tolist())
+            with WC.phase("eval", thread="actor", step=priming_step, extra={"priming": True}):
+                real_action, action_type = env.step(action.tolist())
             start_step_time = time.time()
             done, success, reward, mask = env.get_info_for_step()
             priming_step += 1
@@ -1297,6 +1311,7 @@ def main(_):
                      f"starting fresh at 0 -- checkpoint step "
                      f"numbers (i) are NOT offset and remain exactly comparable across runs.")
 
+    WC.scalar("training_start_t", WC.elapsed(), step=start_step)
     for i in tqdm.tqdm(
         range(start_step, cfg.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
     ):
@@ -1318,7 +1333,8 @@ def main(_):
         # Skip model inference while human is controlling.
         if not action_plan and action_type != "human":
             sample_start = time.time()
-            action_chunk, agent, new_si = agent.sample_actions(observation)
+            with WC.phase("inference", thread="actor", step=i, extra={"replan_steps": cfg.replan_steps}):
+                action_chunk, agent, new_si = agent.sample_actions(observation)
             episode_log.sample_info_history.append(new_si)
             training_log.record_sample_time(time.time() - sample_start, step_metrics)
             action_plan.extend(action_chunk[:cfg.replan_steps])
@@ -1327,11 +1343,16 @@ def main(_):
 
         elapsed = time.time() - start_step_time
         if elapsed < dt:
-            time.sleep(dt - elapsed)
+            with WC.phase("robot_idle", thread="actor", step=i):
+                time.sleep(dt - elapsed)
+        else:
+            # Missed the control deadline: in sync mode this is the learner stalling the robot.
+            WC.scalar("deadline_overrun_s", elapsed - dt, step=i)
 
         has_action = bool(action_plan)
         action = action_plan.popleft() if has_action else np.zeros_like(example_action.squeeze())
-        real_action, action_type = env.step(action.tolist())
+        with WC.phase("robot_step", thread="actor", step=i):
+            real_action, action_type = env.step(action.tolist())
         start_step_time = time.time()
         # Fetch AFTER env.step(): now reflects the consequence of
         # `real_action` taken from `observation`, matching the (o_i, a_i,
@@ -1373,7 +1394,8 @@ def main(_):
 
         if done:
             batch_processor.on_episode_done(success)
-            env.reset()
+            with WC.phase("reset", thread="actor", step=i):
+                env.reset()
 
             if is_on_policy_algo:
                 pass  # rollout-driven, handled above
@@ -1406,6 +1428,7 @@ def main(_):
                 training_log._success_window.pop(0)
             if len(training_log._success_window) >= success_rate_window:
                 step_metrics["eval/success_rate"] = np.mean(training_log._success_window)
+                WC.scalar("eval/success_rate", step_metrics["eval/success_rate"], step=i)
             
             episode_log.reset()
             batch_processor.on_episode_start()
@@ -1417,7 +1440,8 @@ def main(_):
 
         if cfg.checkpoint_model and cfg.checkpoint_interval > 0 and i > 0 and i % cfg.checkpoint_interval == 0:
             try:
-                save_checkpoint(checkpoint_manager, agent, i)
+                with WC.phase("other", thread="learner", step=i, extra={"what": "checkpoint"}):
+                    save_checkpoint(checkpoint_manager, agent, i)
                 # save_checkpoint() only blocks for the synchronous portion
                 # of the save (per Orbax's own docs: "Finished blocking save
                 # in N seconds. Continuing to save asynchronously...") --
@@ -1452,7 +1476,9 @@ def main(_):
         if eval_env is not None and i > 0 and i % rl_eval_interval == 0:
             try:
                 episode_seeds = get_or_create_episode_seeds(checkpoint_dir_path, rl_eval_episodes, rl_eval_seed)
-                success_rate, stderr = run_rigorous_eval(agent, eval_env, episode_seeds, cfg)
+                with WC.phase("eval", thread="actor", step=i, extra={"rigorous": True}):
+                    success_rate, stderr = run_rigorous_eval(agent, eval_env, episode_seeds, cfg)
+                WC.scalar("eval_rigorous/success_rate", success_rate, step=i)
                 wandb.log({
                     "eval_rigorous/success_rate": success_rate,
                     "eval_rigorous/success_rate_stderr": stderr,

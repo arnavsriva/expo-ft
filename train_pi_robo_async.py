@@ -71,6 +71,12 @@ config_flags.DEFINE_config_file(
 
 def main(_):
     init_logging()
+    # wallclock-vla-rl: optional phase tracing (no-op unless WALLCLOCK_TRACE is set)
+    from expo_ft.utils.wallclock_hooks import make_wallclock
+    WC = make_wallclock({
+        "role": "learner+actor", "mode": "async", "utd_ratio": FLAGS.utd_ratio,
+        "batch_size": FLAGS.batch_size, "replan_steps": FLAGS.replan_steps, "seed": FLAGS.seed,
+    })
     assert FLAGS.offline_ratio >= 0.0 and FLAGS.offline_ratio <= 1.0
 
     jax.config.update(
@@ -290,9 +296,12 @@ def main(_):
                 learner_agent = learner_agent.replace(
                     rng=jax.device_put(learner_agent.rng, replicated_sharding)
                 )
-                learner_agent, update_info = learner_agent.update(
-                    learner_agent, batch, FLAGS.utd_ratio, actor_batch
-                )
+                with WC.phase("learner_update", thread="learner", update=WC.n_updates,
+                              step=_env_step[0], extra={"utd_ratio": FLAGS.utd_ratio}):
+                    learner_agent, update_info = learner_agent.update(
+                        learner_agent, batch, FLAGS.utd_ratio, actor_batch
+                    )
+                WC.n_updates += FLAGS.utd_ratio
 
                 with _publish_lock:
                     _published[0] = learner_agent._infer_cache
@@ -356,7 +365,8 @@ def main(_):
         # Skip model inference while human is controlling.
         if not action_plan and action_type != "human":
             sample_start = time.time()
-            action_chunk, _actor_agent, new_si = _actor_agent.sample_actions(observation)
+            with WC.phase("inference", thread="actor", step=i, extra={"replan_steps": FLAGS.replan_steps}):
+                action_chunk, _actor_agent, new_si = _actor_agent.sample_actions(observation)
             episode_log.sample_info_history.append(new_si)
             training_log.record_sample_time(time.time() - sample_start, step_metrics)
             action_plan.extend(action_chunk[:FLAGS.replan_steps])
@@ -365,11 +375,15 @@ def main(_):
 
         elapsed = time.time() - start_step_time
         if elapsed < dt:
-            time.sleep(dt - elapsed)
+            with WC.phase("robot_idle", thread="actor", step=i):
+                time.sleep(dt - elapsed)
+        else:
+            WC.scalar("deadline_overrun_s", elapsed - dt, step=i)
 
         has_action = bool(action_plan)
         action = action_plan.popleft() if has_action else np.zeros_like(example_action.squeeze())
-        real_action, action_type = env.step(action.tolist())
+        with WC.phase("robot_step", thread="actor", step=i):
+            real_action, action_type = env.step(action.tolist())
         start_step_time = time.time()
 
         episode_log.record_step(observation, len(action_plan), action_type, real_action, reward)
@@ -393,7 +407,8 @@ def main(_):
             with _buffer_lock:
                 batch_processor.on_episode_done(success)
             _episode_done.set()
-            env.reset()
+            with WC.phase("reset", thread="actor", step=i):
+                env.reset()
 
             training_log.on_episode_done(episode_log, success, step_metrics)
             episode_log.reset()
