@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import flax.nnx as nnx
 import flax.traverse_util as traverse_util
+import os
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -202,6 +203,13 @@ def _bind_model(train_state: training_utils.TrainState, train: bool = False):
     return model
 
 
+# wallclock-vla-rl: flow-matching denoising steps as an inference-latency knob.
+# Unset -> openpi default (10). A Python int captured at trace time, so it is static under jit.
+_WALLCLOCK_SAMPLE_KWARGS = (
+    {"num_steps": int(os.environ["WALLCLOCK_FLOW_STEPS"])} if os.environ.get("WALLCLOCK_FLOW_STEPS") else {}
+)
+
+
 @functools.partial(jax.jit, static_argnames=['train', 'num_samples'])
 def _jitted_infer(transformed_inputs, train_state, rng, policy_metadata, train, num_samples):
     model = _bind_model(train_state, train=False)
@@ -210,7 +218,7 @@ def _jitted_infer(transformed_inputs, train_state, rng, policy_metadata, train, 
         rng=rng,
         transforms=[],  
         output_transforms=[],
-        sample_kwargs=dict(train=train, num_samples=num_samples),
+        sample_kwargs=dict(train=train, num_samples=num_samples, **_WALLCLOCK_SAMPLE_KWARGS),
         metadata=policy_metadata,
         is_pytorch=False,
         pytorch_device=None,
