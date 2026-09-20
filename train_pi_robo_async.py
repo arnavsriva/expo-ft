@@ -68,14 +68,44 @@ config_flags.DEFINE_config_file(
     "File path to the task configuration.",
     lock_config=False,
 )
+# wallclock-vla-rl: ManiSkill task YAML (same files as train_pi_robo.py). When set, it takes
+# precedence over --config_task and fills dataset_path/num_data/utd_ratio/batch_size/replan_steps/
+# seed/max_steps/offline_ratio/run_name from the YAML unless given explicitly.
+flags.DEFINE_string("task_config", None, "Path to a task YAML (configs/task/maniskill/*.yaml).")
+flags.DEFINE_boolean("local_env", False, "Run the ManiSkill env in-process instead of over WebSocket.")
 
 def main(_):
     init_logging()
+    # wallclock-vla-rl: task config from YAML (ManiSkill) or the legacy py config (DROID)
+    task = FLAGS.config_task
+    if FLAGS.task_config:
+        from expo_ft.utils.config_loader import get_sft_config_name, load_task_config
+        from expo_ft.utils.wallclock_hooks import apply_env_overrides
+        from expo_ft.utils.yaml_overrides import apply_expo_yaml_overrides
+        task = load_task_config(FLAGS.task_config)
+        apply_env_overrides(task)
+        FLAGS.config.pi05_config_name = get_sft_config_name(task)
+        FLAGS.config.skip_repack_transforms = task.skip_repack_transforms
+        apply_expo_yaml_overrides(task, FLAGS.config)
+        if not FLAGS.dataset_path:
+            FLAGS.dataset_path = task.droid_format_dir
+        if not FLAGS.num_data:
+            FLAGS.num_data = int(getattr(task, "num_data_rl", 0) or 0)
+        for name in ("utd_ratio", "batch_size", "replan_steps", "seed", "max_steps", "offline_ratio"):
+            if hasattr(task, name):
+                setattr(FLAGS, name, getattr(task, name))
+        if FLAGS.run_name is None:
+            FLAGS.run_name = getattr(task, "run_name", "async")
+        logging.info("[task_config] %s -> utd=%s batch=%s replan=%s seed=%s max_steps=%s",
+                     FLAGS.task_config, FLAGS.utd_ratio, FLAGS.batch_size, FLAGS.replan_steps,
+                     FLAGS.seed, FLAGS.max_steps)
     # wallclock-vla-rl: optional phase tracing (no-op unless WALLCLOCK_TRACE is set)
     from expo_ft.utils.wallclock_hooks import make_wallclock
     WC = make_wallclock({
         "role": "learner+actor", "mode": "async", "utd_ratio": FLAGS.utd_ratio,
         "batch_size": FLAGS.batch_size, "replan_steps": FLAGS.replan_steps, "seed": FLAGS.seed,
+        "task": getattr(task, "env_id", None), "control_hz": getattr(task, "control_hz", None),
+        "local_env": FLAGS.local_env,
     })
     assert FLAGS.offline_ratio >= 0.0 and FLAGS.offline_ratio <= 1.0
 
@@ -128,15 +158,15 @@ def main(_):
     init_wandb(checkpoint_dir_path, resuming, FLAGS.project_name, FLAGS.run_name)
     wandb.config.update(FLAGS.flag_values_dict(), allow_val_change=resuming)
 
-    if FLAGS.config_task.env_type in ('droid', 'sim'):
+    if task.env_type in ('droid', 'sim'):
         dataset = process_droid_dataset(
             FLAGS.dataset_path,
-            FLAGS.config_task,
+            task,
             num_data=FLAGS.num_data,
         )
         example_action = dataset[0]['actions'][np.newaxis]
     else:
-        raise ValueError(f"Unsupported dataset type: {FLAGS.config_task.env_type}")
+        raise ValueError(f"Unsupported dataset type: {task.env_type}")
     
     # Create training environment wrapper directly
     train_env_creation_request = {
@@ -146,11 +176,15 @@ def main(_):
     }
 
     logging.info("Creating environment...")
-    env = EnvClientWrapper(
-        env_creation_request=train_env_creation_request,
-        host=FLAGS.client_host,
-        port=FLAGS.client_port
-    )
+    if FLAGS.local_env:
+        from expo_ft.env.env_factory import make_env_wrapper
+        env = make_env_wrapper(env_creation_request=train_env_creation_request, cfg=task)
+    else:
+        env = EnvClientWrapper(
+            env_creation_request=train_env_creation_request,
+            host=FLAGS.client_host,
+            port=FLAGS.client_port
+        )
     env.reset()
     logging.info(f"Created training environment {env.env_id}")
 
@@ -219,7 +253,7 @@ def main(_):
         resume=resuming,
         replan_steps=FLAGS.replan_steps,
         default_prompt=env.task_description,
-        residual_action_xyzg=FLAGS.config_task.residual_action_xyzg,
+        residual_action_xyzg=getattr(task, "residual_action_xyzg", False),
     )
     
     start_step = 0
@@ -240,11 +274,11 @@ def main(_):
 
     batch_processor.on_episode_start()
 
-    dt = 1.0 / FLAGS.config_task.control_hz
+    dt = 1.0 / task.control_hz
     done = False
     env.reset()
     start_step_time = time.time()
-    env.step(FLAGS.config_task.example_action.squeeze().tolist())
+    env.step(example_action.squeeze().tolist())
     action_plan = deque()
     action_type = "policy"
     combine_rng = jax.random.PRNGKey(FLAGS.seed + 100)
