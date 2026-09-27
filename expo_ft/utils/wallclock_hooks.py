@@ -30,6 +30,8 @@ _ENV_OVERRIDES = {
     "WALLCLOCK_REPLAN": ("replan_steps", int),
     "WALLCLOCK_BATCH": ("batch_size", int),
     "WALLCLOCK_MAX_STEPS": ("max_steps", int),
+    "WALLCLOCK_EVAL_EPISODES": ("rl_eval_episodes", int),
+    "WALLCLOCK_EVAL_INTERVAL": ("rl_eval_interval", int),
 }
 
 
