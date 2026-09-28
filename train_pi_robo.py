@@ -1394,6 +1394,7 @@ def main(_):
 
         if done:
             batch_processor.on_episode_done(success)
+            WC.scalar("episode_success", float(success), step=i)
             with WC.phase("reset", thread="actor", step=i):
                 env.reset()
 

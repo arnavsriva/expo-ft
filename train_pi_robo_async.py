@@ -441,6 +441,7 @@ def main(_):
             with _buffer_lock:
                 batch_processor.on_episode_done(success)
             _episode_done.set()
+            WC.scalar("episode_success", float(success), step=i)
             with WC.phase("reset", thread="actor", step=i):
                 env.reset()
 
