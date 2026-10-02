@@ -426,7 +426,8 @@ def main(_):
     train_env_creation_request = {
         "example_action": example_action,
         "env_usage": "train",
-        "video_dir": train_video_dir,
+        # wallclock-vla-rl: WALLCLOCK_NO_VIDEO=1 skips the per-episode mp4s (disk, and ffmpeg time in reset)
+        "video_dir": None if os.environ.get("WALLCLOCK_NO_VIDEO") else train_video_dir,
     }
 
     logging.info("Creating environment...")

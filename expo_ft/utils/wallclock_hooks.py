@@ -32,6 +32,8 @@ _ENV_OVERRIDES = {
     "WALLCLOCK_MAX_STEPS": ("max_steps", int),
     "WALLCLOCK_EVAL_EPISODES": ("rl_eval_episodes", int),
     "WALLCLOCK_EVAL_INTERVAL": ("rl_eval_interval", int),
+    "WALLCLOCK_CKPT_BUFFER": ("checkpoint_buffer", lambda v: v.lower() in ("1", "true", "yes")),
+    "WALLCLOCK_CKPT_MODEL": ("checkpoint_model", lambda v: v.lower() in ("1", "true", "yes")),
 }
 
 
